@@ -1,0 +1,105 @@
+{
+  "schema_version": "1.0.0",
+  "kind": "peldrun.llm_provider",
+  "id": "gigachat",
+  "name": "GigaChat (Sber)",
+  "display_name": "GigaChat",
+  "version": "1.0.0",
+  "description": "GigaChat is a family of Russian language models from Sber. Requires OAuth authentication and a custom CA bundle (Russian Trusted Root CA).",
+  "api_contract": "peldrun.llm.provider.v1",
+  "transport": "native",
+  "entry_point": "gigachat_peldrun.adapter:GigaChatAdapter",
+  "dependencies": ["gigachat>=0.2.0,<1.0"],
+  "runtime": {
+    "type": "python",
+    "python": ">=3.12,<3.13"
+  },
+  "author": "PELDRUN Community",
+  "author_url": "https://github.com/peldrun/peldrun-providers",
+  "homepage": "https://developers.sber.ru/docs/ru/gigachat/guides/main",
+  "license": "MIT",
+  "tags": ["gigachat", "sber", "russian", "oauth", "enterprise"],
+  "connection_fields": [
+    {
+      "key": "credentials",
+      "label": "Authorization Key",
+      "type": "password",
+      "required": true,
+      "placeholder": "Base64-encoded client_id:client_secret",
+      "description": "From the Sber Studio dashboard. This is the 'Authorization key' for your GigaChat app. Format: base64(client_id + ':' + client_secret)."
+    },
+    {
+      "key": "scope",
+      "label": "Account Scope",
+      "type": "select",
+      "required": true,
+      "default": "PERS",
+      "options": [
+        {"value": "PERS", "label": "Personal (PERS)"},
+        {"value": "B2B", "label": "Business (B2B)"},
+        {"value": "CORP", "label": "Corporate (CORP)"}
+      ],
+      "description": "Which Sber API scope to authenticate against. B2B/CORP require a contract with Sber."
+    },
+    {
+      "key": "ca_bundle_path",
+      "label": "Russian Root CA Bundle",
+      "type": "file",
+      "required": false,
+      "accept": ".pem,.crt,.cer",
+      "placeholder": "/etc/ssl/certs/russian_trusted_root_ca.pem",
+      "visible_if": {"scope": "B2B"},
+      "description": "B2B and CORP scopes use a different CA that certifi does not include. Required for those scopes. Download from https://gu-st.ru/content/Other/doc/russiantrustedca.pem"
+    },
+    {
+      "key": "verify_ssl",
+      "label": "Verify SSL Certificates",
+      "type": "boolean",
+      "required": false,
+      "default": true,
+      "description": "Disable ONLY for development against a local mock server."
+    }
+  ],
+  "certificates": [
+    {
+      "id": "russian_trusted_root_ca",
+      "display_name": "Russian Trusted Root CA",
+      "description": "The Russian Trusted Root CA is required for GigaChat's TLS connections. It is not included in the standard certifi trust store shipped with Python.",
+      "download_url": "https://gu-st.ru/content/Other/doc/russiantrustedca.pem",
+      "download_sha256": null,
+      "download_filename": "russian_trusted_root_ca.pem",
+      "default_destination": null,
+      "certificate_type": "root_ca",
+      "required": true,
+      "required_for_fields": [],
+      "docs_url": "https://www.gosuslugi.ru/crt",
+      "issuer": "Ministry of Digital Development of the Russian Federation",
+      "expires_at": null
+    }
+  ],
+  "runtime_hints": {
+    "requires_custom_tls": true,
+    "requires_token_refresh": true,
+    "token_lifetime_seconds": 1800,
+    "docs_url": "https://developers.sber.ru/docs/ru/gigachat/guides/main"
+  },
+  "features": {
+    "model_discovery": true,
+    "native_streaming": true,
+    "buffered_streaming": true,
+    "tool_calling": true,
+    "parallel_tool_calls": false,
+    "forced_tool_choice": false,
+    "vision": true,
+    "audio": false,
+    "structured_output": false,
+    "usage_reporting": true,
+    "reasoning": false
+  },
+  "permissions": {
+    "network": "connection_endpoint",
+    "secrets": ["connection.api_key"],
+    "workspace_access": false,
+    "shell_execute": false
+  }
+}

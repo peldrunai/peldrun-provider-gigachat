@@ -1,0 +1,6 @@
+# package/requirements.txt
+# GigaChat Provider Package for PELDRUN.
+# Pinned to major versions to allow patch updates but avoid breaking changes.
+
+gigachat>=0.2.0,<1.0
+httpx>=0.27,<0.28
