@@ -782,7 +782,59 @@ class GigaChatAdapter:
         except GigaChatException as exc:
             raise self._map_exception(exc) from exc
         except Exception as exc:
-            raise self._map_exception(exc) from exc
+            # ------------------------------------------------------------------
+            # [FIX-VALIDATION] GigaChat-2-Max sometimes returns a v1-style
+            # response (with ``choices``) while the installed SDK expects
+            # a v2-style response (with ``messages``). This triggers a
+            # Pydantic ``ValidationError`` inside the SDK *before* our
+            # ``_convert_response`` can normalise the shape.
+            #
+            # We catch the validation error here and attempt to extract
+            # the raw response data from the error context. The
+            # ``_convert_response`` helper already knows how to handle
+            # both shapes, so once we get the raw dict it will work.
+            # ------------------------------------------------------------------
+            from pydantic import ValidationError
+
+            if isinstance(exc, ValidationError):
+                # The exception exposes the raw input via ``exc.errors()``.
+                # Each error entry carries an ``input`` key with the
+                # original payload. We scan for the first entry that
+                # contains a dict (the raw response) and reconstruct a
+                # minimal object that ``_convert_response`` can consume.
+                raw_response = None
+                for err in exc.errors():
+                    inp = err.get("input")
+                    if isinstance(inp, dict):
+                        raw_response = inp
+                        break
+
+                if raw_response is not None:
+                    logger.warning(
+                        "GigaChatAdapter: caught Pydantic ValidationError "
+                        "on ChatCompletionResponse; attempting to salvage "
+                        "raw response. Errors: %s",
+                        exc.errors(),
+                    )
+                    # Wrap the raw dict in a lightweight object that
+                    # exposes the attributes ``_convert_response`` reads.
+                    # We use a simple namespace class because Pydantic
+                    # models cannot be constructed from a v1 payload
+                    # without triggering the same validation error.
+                    class _RawResponse:
+                        def __init__(self, data):
+                            self._data = data
+                            # v1 shape: choices[0].message
+                            self.choices = data.get("choices") or []
+                            # v2 shape: messages[0]
+                            self.messages = data.get("messages") or []
+                            self.usage = data.get("usage")
+
+                    result = _RawResponse(raw_response)
+                else:
+                    raise self._map_exception(exc) from exc
+            else:
+                raise self._map_exception(exc) from exc
 
         return self._convert_response(result, compiled.model)
 
@@ -812,46 +864,64 @@ class GigaChatAdapter:
 
         try:
             # ------------------------------------------------------------------
-            # Unified streaming path — always use the NON-STREAMING
-            # v2 completion for BOTH text and multimodal turns.
+            # Dispatch to the correct non-streaming path based on content.
             #
-            # Why not native streaming?
+            # Why two paths (v1 vs v2)?
             #
-            # The GigaChat SDK's ``astream()`` (v1 Chat object) now
-            # returns chunks whose shape depends on the SDK version.
-            # On recent builds those chunks are v2 ``ChatCompletionChunk``
-            # WITHOUT a ``.choices`` attribute — the streaming normalizer
-            # expects ``.choices`` and raises::
+            #   * v2 (``ChatCompletionRequest`` via ``achat.create``) is
+            #     REQUIRED for vision — only v2 delivers image pixels via
+            #     ``ChatContentPart.files``. But it has a known instability
+            #     with GigaChat-2-Max when tools are present: the server
+            #     sometimes returns a v1-shaped body (with ``choices`` and
+            #     no ``messages``) from the v2 endpoint, which crashes the
+            #     SDK's Pydantic validator with:
             #
-            #   RuntimeError: 'ChatCompletionChunk' object has no
-            #   attribute 'choices'
+            #       ValidationError: 1 validation error for
+            #       ChatCompletionResponse — messages: Field required
             #
-            # Rather than branch on SDK version and duplicate the
-            # normalizer's logic, we use the non-streaming v2 path
-            # (``achat.create``) uniformly and emit:
+            #     This breaks every agent turn that uses a tool, and by
+            #     extension every file mention (since injecting the file
+            #     content changes the prompt shape enough to trigger the
+            #     server's v1 fallback).
             #
-            #   * ONE CONTENT_DELTA with the full text
-            #   * TOOL_CALL_START + TOOL_CALL_COMPLETE per tool
-            #   * ONE MESSAGE_COMPLETE with finish_reason + usage
+            #   * v1 (``Chat`` via ``self._client.achat``) is what
+            #     ``generate()`` already uses successfully for text + tools.
+            #     It returns a ``ChatCompletion`` with ``choices[0].message``,
+            #     which ``_convert_response`` normalises identically. So
+            #     every text-only request (including tool turns and file
+            #     mentions) uses v1, and only multimodal turns use v2.
             #
-            # Trade-off: the user sees the full answer appear atomically
-            # instead of token-by-token. Given the alternative is a
-            # guaranteed runtime error on every message, this is the
-            # only correct choice for this SDK build.
+            # Native ``astream()`` is still avoided — it returns v2
+            # chunks without ``.choices``, breaking the normalizer. The
+            # non-streaming calls below produce one CONTENT_DELTA with
+            # the full text, plus per-tool events, which is functionally
+            # identical for the user.
             # ------------------------------------------------------------------
-            req = await self._build_chat_completion_request(
-                compiled, stream=False
-            )
-
             response = None
-            try:
-                response = await self._client.achat.create(req)
-            except (AttributeError, TypeError):
+            if self._has_images(compiled):
+                # Multimodal path — v2 is the ONLY path that delivers
+                # image pixels to the model.
+                req = await self._build_chat_completion_request(
+                    compiled, stream=False
+                )
                 try:
-                    response = await self._client.achat(req)
+                    response = await self._client.achat.create(req)
                 except (AttributeError, TypeError):
-                    # Last resort: sync path via chat.create.
-                    response = self._client.chat.create(req)
+                    try:
+                        response = await self._client.achat(req)
+                    except (AttributeError, TypeError):
+                        # Last resort: sync path via chat.create.
+                        response = self._client.chat.create(req)
+            else:
+                # Text-only path (including tool turns and file mentions)
+                # — same v1 call that ``generate()`` already uses.
+                # Bypasses the GigaChat-2-Max v2 validation bug entirely.
+                chat = await self._build_chat_payload(compiled)
+                try:
+                    response = await self._client.achat(chat)
+                except (AttributeError, TypeError):
+                    # Some SDK builds expose only the sync path.
+                    response = self._client.chat(chat)
 
             llm_resp = self._convert_response(response, compiled.model)
 
@@ -1714,6 +1784,42 @@ class GigaChatAdapter:
                     content=content_parts,
                 )
             )
+
+        # ------------------------------------------------------------------
+        # [FIX-MIXED-MODE] GigaChat v2 does NOT support tool calling.
+        # When an image is present, tools are silently discarded by the
+        # SDK. Without an explicit note, the model hallucinates tool
+        # calls or loops trying to invoke tools. Append a directive so
+        # it responds with plain text and explains what the user should
+        # do next.
+        # ------------------------------------------------------------------
+        if compiled.tools:
+            logger.warning(
+                "GigaChatAdapter: tools are ignored in multimodal (v2) mode. "
+                "The agent will not be able to call tools this turn."
+            )
+            sys_warning = (
+                "\n\n[SYSTEM NOTE: Tool calling is disabled because an image was "
+                "provided. You cannot use tools this turn. Respond with plain "
+                "text. If you need to perform a tool action (e.g. edit a file), "
+                "explain what needs to be done so the user can send a follow-up "
+                "text-only request.]"
+            )
+            has_sys = False
+            for msg in messages:
+                if msg.role == "system":
+                    if msg.content:
+                        msg.content[0].text = (msg.content[0].text or "") + sys_warning
+                    has_sys = True
+                    break
+            if not has_sys:
+                messages.insert(
+                    0,
+                    ChatMessage(
+                        role="system",
+                        content=[ChatContentPart(text=sys_warning.strip())]
+                    )
+                )
 
         # Build ChatModelOptions only with non-None values. GigaChat's
         # Pydantic schema accepts None, but serialized `null` fields may
