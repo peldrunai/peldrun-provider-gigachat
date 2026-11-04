@@ -45,6 +45,13 @@ echo "Building ${ZIP_NAME} (version ${VERSION})..."
 mkdir -p "${DIST_DIR}"
 rm -f "${ZIP_PATH}"
 
+# Pre-cleanup: remove __pycache__ and *.pyc from the source tree so
+# they never reach the archive. The zip -x flags below already filter
+# them out, but explicit deletion guarantees the tree stays clean
+# (and matters if the caller ever inspects package/ directly).
+find "${PACKAGE_DIR}" -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
+find "${PACKAGE_DIR}" -type f -name "*.pyc" -delete 2>/dev/null || true
+
 # Change into package/ so the ZIP root contains manifest.json directly.
 # Do NOT zip the package/ directory itself; that would nest everything
 # one level too deep and the validator would reject it.
