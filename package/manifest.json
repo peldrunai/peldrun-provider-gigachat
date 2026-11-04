@@ -63,9 +63,24 @@
   "certificates": [
     {
       "id": "russian_trusted_root_ca",
-      "display_name": "Russian Trusted Root CA",
-      "description": "The Russian Trusted Root CA is required for GigaChat's TLS connections. It is not included in the standard certifi trust store shipped with Python.",
-      "download_url": "https://gu-st.ru/content/Other/doc/russiantrustedca.pem",
+      "display_name": "Russian Trusted Chain (Root + Intermediate)",
+      "description": "Sber's TLS chain requires both the Russian Trusted Root CA and the intermediate Sub CA in one bundle. The Certificate Manager downloads both files and merges them automatically — no manual merging is required.",
+      "download_url": "https://gu-st.ru/content/lending/russian_trusted_root_ca_pem.crt",
+      "download_urls": [
+        {
+          "url": "https://gu-st.ru/content/lending/russian_trusted_root_ca_pem.crt",
+          "filename": "russian_trusted_root_ca.pem",
+          "role": "root",
+          "sha256": null
+        },
+        {
+          "url": "https://gu-st.ru/content/lending/russian_trusted_sub_ca_pem.crt",
+          "filename": "russian_trusted_sub_ca.pem",
+          "role": "intermediate",
+          "sha256": null
+        }
+      ],
+      "merge_strategy": "concatenate_intermediate_first",
       "download_sha256": null,
       "download_filename": "russian_trusted_root_ca.pem",
       "default_destination": null,
@@ -95,6 +110,50 @@
     "structured_output": false,
     "usage_reporting": true,
     "reasoning": false
+  },
+  "model_facts": {
+    "GigaChat-2": {
+      "max_context_length": 128000,
+      "max_output_tokens": 8192,
+      "vision": false,
+      "tools": true,
+      "reasoning": false
+    },
+    "GigaChat-2-Pro": {
+      "max_context_length": 128000,
+      "max_output_tokens": 8192,
+      "vision": true,
+      "tools": true,
+      "reasoning": false
+    },
+    "GigaChat-2-Max": {
+      "max_context_length": 128000,
+      "max_output_tokens": 8192,
+      "vision": true,
+      "tools": true,
+      "reasoning": false,
+      "audio": true
+    },
+    "GigaChat-3-Lightning": {
+      "max_context_length": 262144,
+      "max_output_tokens": 8192,
+      "vision": false,
+      "tools": true,
+      "reasoning": false
+    },
+    "GigaChat-3-Pro": {
+      "max_context_length": 262144,
+      "max_output_tokens": 65536,
+      "vision": true,
+      "tools": true
+    },
+    "GigaChat-3-Ultra": {
+      "max_context_length": 128000,
+      "max_output_tokens": 8192,
+      "vision": true,
+      "tools": true,
+      "audio": true
+    }
   },
   "permissions": {
     "network": "connection_endpoint",
