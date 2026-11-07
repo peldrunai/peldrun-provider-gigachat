@@ -4,7 +4,7 @@
   "id": "gigachat",
   "name": "GigaChat (Sber)",
   "display_name": "GigaChat",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "GigaChat is a family of Russian language models from Sber. Requires OAuth authentication and a custom CA bundle (Russian Trusted Root CA).",
   "api_contract": "peldrun.llm.provider.v1",
   "transport": "native",

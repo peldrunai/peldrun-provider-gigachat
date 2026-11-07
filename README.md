@@ -311,4 +311,4 @@ MIT. See `LICENSE`.
 ```
 
 ---
-Windows  PowerShell .\scripts\build.ps1
+build Windows  PowerShell .\scripts\build.ps1

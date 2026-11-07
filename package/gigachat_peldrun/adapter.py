@@ -864,43 +864,26 @@ class GigaChatAdapter:
 
         try:
             # ------------------------------------------------------------------
-            # Dispatch to the correct non-streaming path based on content.
+            # Dispatch based on content:
             #
-            # Why two paths (v1 vs v2)?
+            #   * Multimodal → non-streaming via v2 (only path that
+            #     delivers image pixels).
+            #   * Text-only → TRUE streaming via ``astream()``.
             #
-            #   * v2 (``ChatCompletionRequest`` via ``achat.create``) is
-            #     REQUIRED for vision — only v2 delivers image pixels via
-            #     ``ChatContentPart.files``. But it has a known instability
-            #     with GigaChat-2-Max when tools are present: the server
-            #     sometimes returns a v1-shaped body (with ``choices`` and
-            #     no ``messages``) from the v2 endpoint, which crashes the
-            #     SDK's Pydantic validator with:
-            #
-            #       ValidationError: 1 validation error for
-            #       ChatCompletionResponse — messages: Field required
-            #
-            #     This breaks every agent turn that uses a tool, and by
-            #     extension every file mention (since injecting the file
-            #     content changes the prompt shape enough to trigger the
-            #     server's v1 fallback).
-            #
-            #   * v1 (``Chat`` via ``self._client.achat``) is what
-            #     ``generate()`` already uses successfully for text + tools.
-            #     It returns a ``ChatCompletion`` with ``choices[0].message``,
-            #     which ``_convert_response`` normalises identically. So
-            #     every text-only request (including tool turns and file
-            #     mentions) uses v1, and only multimodal turns use v2.
-            #
-            # Native ``astream()`` is still avoided — it returns v2
-            # chunks without ``.choices``, breaking the normalizer. The
-            # non-streaming calls below produce one CONTENT_DELTA with
-            # the full text, plus per-tool events, which is functionally
-            # identical for the user.
+            # The prior implementation awaited the full response and
+            # emitted a single CONTENT_DELTA with the complete text.
+            # That made the UI appear frozen for the entire LLM call
+            # (10-30 seconds per step for GigaChat) and then dumped
+            # everything at once — the exact "no live stream" symptom
+            # reported by the user, contrasting sharply with LM Studio
+            # whose native adapter streams token-by-token via httpx.
             # ------------------------------------------------------------------
-            response = None
+
+            # ==============================================================
+            # Multimodal path — non-streaming (GigaChat v2 image analysis
+            # does not expose incremental chunks).
+            # ==============================================================
             if self._has_images(compiled):
-                # Multimodal path — v2 is the ONLY path that delivers
-                # image pixels to the model.
                 req = await self._build_chat_completion_request(
                     compiled, stream=False
                 )
@@ -912,49 +895,260 @@ class GigaChatAdapter:
                     except (AttributeError, TypeError):
                         # Last resort: sync path via chat.create.
                         response = self._client.chat.create(req)
-            else:
-                # Text-only path (including tool turns and file mentions)
-                # — same v1 call that ``generate()`` already uses.
-                # Bypasses the GigaChat-2-Max v2 validation bug entirely.
-                chat = await self._build_chat_payload(compiled)
-                try:
-                    response = await self._client.achat(chat)
-                except (AttributeError, TypeError):
-                    # Some SDK builds expose only the sync path.
-                    response = self._client.chat(chat)
 
-            llm_resp = self._convert_response(response, compiled.model)
-
-            if llm_resp.content:
+                llm_resp = self._convert_response(response, compiled.model)
+                if llm_resp.content:
+                    seq += 1
+                    yield LLMStreamEvent(
+                        type=StreamEventType.CONTENT_DELTA,
+                        content_delta=llm_resp.content,
+                        sequence=seq,
+                    )
+                for tc in llm_resp.tool_calls:
+                    seq += 1
+                    yield LLMStreamEvent(
+                        type=StreamEventType.TOOL_CALL_START,
+                        tool_call_id=tc.id,
+                        tool_name=tc.name,
+                        sequence=seq,
+                    )
+                    seq += 1
+                    yield LLMStreamEvent(
+                        type=StreamEventType.TOOL_CALL_COMPLETE,
+                        tool_call_id=tc.id,
+                        tool_name=tc.name,
+                        tool_arguments_complete=tc.arguments,
+                        sequence=seq,
+                    )
                 seq += 1
                 yield LLMStreamEvent(
-                    type=StreamEventType.CONTENT_DELTA,
-                    content_delta=llm_resp.content,
+                    type=StreamEventType.MESSAGE_COMPLETE,
+                    finish_reason=llm_resp.finish_reason or "stop",
+                    usage=llm_resp.usage,
                     sequence=seq,
                 )
+                return
 
-            for tc in llm_resp.tool_calls:
+            # ==============================================================
+            # Text-only path — TRUE streaming via ``astream()``.
+            #
+            # Chunk shape depends on the installed SDK version:
+            #
+            #   * v2 (current SDK): ``chunk.messages[0]`` with
+            #     ``content: List[ChatContentPart]`` and
+            #     ``function_call: Optional[ChatFunctionCall]``.
+            #   * v1 (older SDK): ``chunk.choices[0].delta`` with
+            #     ``content: Optional[str]`` and
+            #     ``function_call: Optional[DeltaFunctionCall]``.
+            #
+            # Both shapes are parsed below, so the adapter works with
+            # either SDK generation. Content deltas are yielded as they
+            # arrive, giving the frontend live token-by-token rendering
+            # identical to the LM Studio native adapter.
+            # ==============================================================
+            chat = await self._build_chat_payload(compiled, stream=True)
+
+            accumulated_text: List[str] = []
+            fn_name: Optional[str] = None
+            fn_args_dict: Dict[str, Any] = {}
+            fn_args_raw: str = ""
+            last_finish_reason: Optional[str] = None
+            got_any_chunk = False
+
+            async for chunk in self._client.astream(chat):
+                got_any_chunk = True
+
+                # Usage may appear on the final chunk.
+                chunk_usage = getattr(chunk, "usage", None)
+                if chunk_usage is not None:
+                    captured_usage = TokenUsage(
+                        input_tokens=getattr(chunk_usage, "prompt_tokens", None),
+                        output_tokens=getattr(chunk_usage, "completion_tokens", None),
+                        total_tokens=getattr(chunk_usage, "total_tokens", None),
+                        source=UsageSource.PROVIDER,
+                    )
+
+                # ------------------------------------------------------
+                # v2 shape: chunk.messages[0]
+                # ------------------------------------------------------
+                v2_messages = getattr(chunk, "messages", None)
+                if v2_messages:
+                    v2_msg = v2_messages[0] if v2_messages else None
+                    if v2_msg is not None:
+                        raw_content = getattr(v2_msg, "content", None)
+                        if isinstance(raw_content, list):
+                            for part in raw_content:
+                                txt = (
+                                    part.get("text")
+                                    if isinstance(part, dict)
+                                    else getattr(part, "text", None)
+                                )
+                                if isinstance(txt, str) and txt:
+                                    accumulated_text.append(txt)
+                                    seq += 1
+                                    yield LLMStreamEvent(
+                                        type=StreamEventType.CONTENT_DELTA,
+                                        content_delta=txt,
+                                        sequence=seq,
+                                    )
+                        elif isinstance(raw_content, str) and raw_content:
+                            accumulated_text.append(raw_content)
+                            seq += 1
+                            yield LLMStreamEvent(
+                                type=StreamEventType.CONTENT_DELTA,
+                                content_delta=raw_content,
+                                sequence=seq,
+                            )
+
+                        fc = getattr(v2_msg, "function_call", None)
+                        if fc is not None:
+                            if getattr(fc, "name", None):
+                                fn_name = str(fc.name)
+                            p_args = (
+                                getattr(fc, "partial_arguments", None)
+                                or getattr(fc, "arguments", None)
+                            )
+                            if isinstance(p_args, dict):
+                                fn_args_dict = p_args
+                            elif isinstance(p_args, str) and p_args:
+                                fn_args_raw += p_args
+
+                        v2_fr = getattr(v2_msg, "finish_reason", None)
+                        if isinstance(v2_fr, str) and v2_fr:
+                            last_finish_reason = v2_fr
+
+                # ------------------------------------------------------
+                # v1 shape: chunk.choices[0].delta
+                # ------------------------------------------------------
+                v1_choices = getattr(chunk, "choices", None)
+                if v1_choices:
+                    v1_choice = v1_choices[0] if v1_choices else None
+                    if v1_choice is not None:
+                        v1_delta = getattr(v1_choice, "delta", None)
+                        if v1_delta is not None:
+                            d_txt = getattr(v1_delta, "content", None)
+                            if isinstance(d_txt, str) and d_txt:
+                                accumulated_text.append(d_txt)
+                                seq += 1
+                                yield LLMStreamEvent(
+                                    type=StreamEventType.CONTENT_DELTA,
+                                    content_delta=d_txt,
+                                    sequence=seq,
+                                )
+
+                            d_fc = getattr(v1_delta, "function_call", None)
+                            if d_fc is not None:
+                                if getattr(d_fc, "name", None):
+                                    fn_name = str(d_fc.name)
+                                d_args = (
+                                    getattr(d_fc, "arguments", None)
+                                    or getattr(d_fc, "partial_arguments", None)
+                                )
+                                if isinstance(d_args, dict):
+                                    fn_args_dict = d_args
+                                elif isinstance(d_args, str) and d_args:
+                                    fn_args_raw += d_args
+
+                        v1_fr = getattr(v1_choice, "finish_reason", None)
+                        if isinstance(v1_fr, str) and v1_fr:
+                            last_finish_reason = v1_fr
+
+            # Fallback if streaming yielded nothing (defensive — should
+            # not happen for a working SDK, but a broken version must
+            # not crash the run).
+            if not got_any_chunk:
+                logger.warning(
+                    "GigaChatAdapter[stream]: astream() yielded zero "
+                    "chunks for model=%s; falling back to non-streaming.",
+                    compiled.model,
+                )
+                chat_nostream = await self._build_chat_payload(
+                    compiled, stream=False
+                )
+                try:
+                    response = await self._client.achat(chat_nostream)
+                except (AttributeError, TypeError):
+                    response = self._client.chat(chat_nostream)
+                llm_resp = self._convert_response(response, compiled.model)
+                if llm_resp.content:
+                    seq += 1
+                    yield LLMStreamEvent(
+                        type=StreamEventType.CONTENT_DELTA,
+                        content_delta=llm_resp.content,
+                        sequence=seq,
+                    )
+                for tc in llm_resp.tool_calls:
+                    seq += 1
+                    yield LLMStreamEvent(
+                        type=StreamEventType.TOOL_CALL_START,
+                        tool_call_id=tc.id,
+                        tool_name=tc.name,
+                        sequence=seq,
+                    )
+                    seq += 1
+                    yield LLMStreamEvent(
+                        type=StreamEventType.TOOL_CALL_COMPLETE,
+                        tool_call_id=tc.id,
+                        tool_name=tc.name,
+                        tool_arguments_complete=tc.arguments,
+                        sequence=seq,
+                    )
+                seq += 1
+                yield LLMStreamEvent(
+                    type=StreamEventType.MESSAGE_COMPLETE,
+                    finish_reason=llm_resp.finish_reason or "stop",
+                    usage=llm_resp.usage,
+                    sequence=seq,
+                )
+                return
+
+            # ------------------------------------------------------
+            # Emit the assembled tool call (if any) AFTER streaming
+            # the text deltas. GigaChat sends the function call
+            # metadata in the final chunk(s), so we can only build it
+            # once the stream ends.
+            # ------------------------------------------------------
+            if fn_name:
+                final_args: Dict[str, Any] = {}
+                if fn_args_dict:
+                    final_args = fn_args_dict
+                elif fn_args_raw:
+                    try:
+                        parsed = json.loads(fn_args_raw)
+                        if isinstance(parsed, dict):
+                            final_args = parsed
+                        else:
+                            final_args = {"value": parsed}
+                    except Exception:
+                        final_args = {"raw": fn_args_raw}
+
+                call_id = f"call_{uuid.uuid4().hex[:8]}"
                 seq += 1
                 yield LLMStreamEvent(
                     type=StreamEventType.TOOL_CALL_START,
-                    tool_call_id=tc.id,
-                    tool_name=tc.name,
+                    tool_call_id=call_id,
+                    tool_name=fn_name,
                     sequence=seq,
                 )
                 seq += 1
                 yield LLMStreamEvent(
                     type=StreamEventType.TOOL_CALL_COMPLETE,
-                    tool_call_id=tc.id,
-                    tool_name=tc.name,
-                    tool_arguments_complete=tc.arguments,
+                    tool_call_id=call_id,
+                    tool_name=fn_name,
+                    tool_arguments_complete=final_args,
                     sequence=seq,
                 )
+                # Normalize GigaChat's "function_call" marker to the
+                # OpenAI-compatible "tool_calls" name that the
+                # downstream normalizer expects.
+                if last_finish_reason in (None, "function_call"):
+                    last_finish_reason = "tool_calls"
 
             seq += 1
             yield LLMStreamEvent(
                 type=StreamEventType.MESSAGE_COMPLETE,
-                finish_reason=llm_resp.finish_reason or "stop",
-                usage=llm_resp.usage,
+                finish_reason=last_finish_reason or "stop",
+                usage=captured_usage,
                 sequence=seq,
             )
             return
