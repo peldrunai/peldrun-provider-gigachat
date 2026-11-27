@@ -17,7 +17,7 @@ See https://developers.sber.ru/docs/ru/gigachat/guides/main for the
 upstream GigaChat API documentation.
 """
 
-__version__ = "1.0.0"
+__version__ = "1.0.4"
 __author__ = "PELDRUN Community"
 
 # The adapter class is exposed here for convenience, but PELDRUN imports
