@@ -86,14 +86,14 @@ jobs:
             exit 1
           fi
           echo "sha256=$SHA" >> "$GITHUB_OUTPUT"
+
       - name: Generate catalog entry
         run: |
           VERSION=$(python -c "import json; print(json.load(open('manifest.json'))['version'])")
-          URL="https://github.com/${{ github.repository }}/releases/download/${{ steps.tag.outputs.tag }}/{{PROVIDER_ID}}-${VERSION}.zip"
+          PROVIDER_ID=$(python -c "import json; print(json.load(open('manifest.json'))['id'])")
+          URL="https://github.com/${{ github.repository }}/releases/download/${{ steps.tag.outputs.tag }}/${PROVIDER_ID}-${VERSION}.zip"
           python scripts/generate_catalog_entry.py \
             --download-url "$URL" \
-            --brand-color "{{BRAND_COLOR}}" \
-            --icon {{ICON_NAME}} \
             --sha256 "${{ steps.verify.outputs.sha256 }}"
 
       - name: Create GitHub Release
