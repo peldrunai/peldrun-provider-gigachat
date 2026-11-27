@@ -22,7 +22,7 @@ Usage:
 
     # Optional overrides (fall back to manifest values when omitted):
     python scripts/generate_catalog_entry.py ... \
-        --brand-color "#F38020" --icon cloudflare
+        --brand_color "#F38020" --icon cloudflare
 
 Exit codes:
     0 - success
@@ -121,7 +121,7 @@ def main(argv: list[str] | None = None) -> int:
         help="SHA-256 of the release ZIP (64 lowercase hex characters).",
     )
     parser.add_argument(
-        "--brand-color",
+        "--brand_color",
         default=None,
         help="Override the manifest brand_color (e.g. '#F38020').",
     )
