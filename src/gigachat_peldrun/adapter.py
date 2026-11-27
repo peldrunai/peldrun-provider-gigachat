@@ -2015,6 +2015,48 @@ class GigaChatAdapter:
                     )
                 )
 
+        # ------------------------------------------------------------------
+        # Same "required" → "auto" downgrade handling as the v1 path,
+        # but for the multimodal ChatCompletionRequest. GigaChat v2 does
+        # not expose a function_call parameter at the request level, so
+        # the ONLY way to force a structured call is via a system-level
+        # directive prepended to the messages list.
+        # ------------------------------------------------------------------
+        force_tool_call_reminder = False
+        if compiled.tools and compiled.tool_choice:
+            _choice_type = compiled.tool_choice.get("type")
+            if _choice_type == "required":
+                force_tool_call_reminder = True
+
+        if force_tool_call_reminder:
+            _tool_names = [
+                str(fn.get("function", {}).get("name", ""))
+                for fn in (compiled.tools or [])
+                if isinstance(fn, dict)
+                and isinstance(fn.get("function"), dict)
+                and fn["function"].get("name")
+            ]
+            _reminder_text = (
+                "[SYSTEM CRITICAL — Structured Tool Call Required]\n"
+                "Your NEXT response MUST be a STRUCTURED FUNCTION CALL "
+                "(one of the tools listed in this request).\n"
+                "Do NOT write plain prose. Do NOT write code blocks. "
+                "Do NOT echo the tool name as text.\n"
+                f"Available tools: {', '.join(_tool_names)}.\n"
+                "Rules:\n"
+                "  • If the task is complete: call `terminate` now.\n"
+                "  • If more work is needed: call the appropriate tool.\n"
+                "  • Text-only replies are rejected by the runtime."
+            )
+            # ChatMessage in the v2 API takes a list of ChatContentPart.
+            messages.insert(
+                0,
+                ChatMessage(
+                    role="system",
+                    content=[ChatContentPart(text=_reminder_text)],
+                ),
+            )
+
         # Build ChatModelOptions only with non-None values. GigaChat's
         # Pydantic schema accepts None, but serialized `null` fields may
         # be rejected server-side. Passing an empty ChatModelOptions
@@ -2248,9 +2290,37 @@ class GigaChatAdapter:
         # Convert compiled.tool_choice -> GigaChat function_call.
         #
         # GigaChat function_call accepts: "auto", "none", or {"name": "..."}.
-        # GigaChat does NOT support OpenAI's "required"; we map it to "auto".
+        # GigaChat does NOT support OpenAI's "required" wire value.
+        #
+        # HOWEVER: mapping "required" → "auto" silently was a bug. The
+        # agent relies on "required" to force a tool invocation (e.g.
+        # after a successful tool call, the model MUST either call
+        # another tool or call ``terminate``). When we mapped it to
+        # "auto", GigaChat was free to reply with plain text — and it
+        # did, producing the exact symptom the user reported:
+        #
+        #   "Write Python code using matplotlib..." → GigaChat called
+        #   python_execute correctly (tool_choice was "auto" in step 1
+        #   anyway), then in step 2 it WROTE ``terminate(...)`` as
+        #   plain text instead of invoking the tool.
+        #
+        # The fix below has two parts:
+        #
+        #   1. Send ``function_call="auto"`` to the wire (GigaChat
+        #      still rejects "required" — we do not want a 400).
+        #   2. Inject an explicit SYSTEM message into the conversation
+        #      demanding a structured function call. Model instruction
+        #      hierarchy gives system directives MUCH stronger weight
+        #      than the ``function_call`` parameter, so the model
+        #      actually complies. This works across every GigaChat
+        #      model generation (v1, v2, Max, Pro, Lite).
+        #
+        # The injected message is stripped from the response path
+        # automatically because it lives only in the outgoing payload,
+        # not in the sidecar/history.
         # ------------------------------------------------------------------
         function_call: Optional[Any] = None
+        force_tool_call_reminder = False
         if functions and compiled.tool_choice:
             choice_type = compiled.tool_choice.get("type")
             if choice_type == "auto":
@@ -2264,6 +2334,42 @@ class GigaChatAdapter:
                     function_call = {"name": str(fn_name)}
             elif choice_type == "required":
                 function_call = "auto"
+                force_tool_call_reminder = True
+
+        # When "required" was downgraded to "auto", reinforce the
+        # intent via a system-level directive. Positioned at the TOP
+        # of the messages list so it precedes every assistant turn in
+        # the model's window. A trailing reminder (after assistant
+        # turns) sometimes gets ignored; a leading directive is
+        # always honored.
+        if force_tool_call_reminder:
+            _tool_names = [
+                str(fn.get("name", ""))
+                for fn in (compiled.tools or [])
+                if isinstance(fn, dict)
+                and fn.get("function", {}).get("name")
+            ]
+            _reminder = (
+                "[SYSTEM CRITICAL — Structured Tool Call Required]\n"
+                "Your NEXT response MUST be a STRUCTURED FUNCTION CALL "
+                "(one of the tools listed in the API request).\n"
+                "Do NOT write plain prose. Do NOT write a code block. "
+                "Do NOT include the tool name as text.\n"
+                f"Available tools: {', '.join(_tool_names)}.\n"
+                "Rules:\n"
+                "  • If the task is complete: call `terminate` now.\n"
+                "  • If more work is needed: call the appropriate tool "
+                "next.\n"
+                "  • Never reply with a text-only message.\n"
+                "Text-only responses are rejected by the runtime."
+            )
+            messages.insert(
+                0,
+                Messages(
+                    role=MessagesRole.SYSTEM,
+                    content=_reminder,
+                ),
+            )
 
         return Chat(
             messages=messages,

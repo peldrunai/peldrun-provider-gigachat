@@ -1,0 +1,101 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (must already exist)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: build-and-release
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Validate manifest
+        run: python scripts/validate_manifest.py
+
+      - name: Resolve release tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${{ github.ref_name }}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Verify tag matches manifest version
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          MANIFEST_VERSION=$(python -c "import json; print(json.load(open('manifest.json'))['version'])")
+          TAG_VERSION="${TAG#v}"
+          if [ "$MANIFEST_VERSION" != "$TAG_VERSION" ]; then
+            echo "::error::Tag version ($TAG_VERSION) does not match manifest.json version ($MANIFEST_VERSION)."
+            exit 1
+          fi
+
+      - name: Build the distributable ZIP
+        run: python scripts/build_package.py
+
+      - name: Verify the produced ZIP
+        id: verify
+        run: |
+          python scripts/verify_package.py > verify.log 2>&1
+          cat verify.log
+          SHA=$(grep -oE '^  sha256: +[0-9a-f]{64}' verify.log | head -1 | awk '{print $2}')
+          if [ -z "$SHA" ]; then
+            echo "::error::Could not extract SHA-256 from verify output."
+            exit 1
+          fi
+          echo "sha256=$SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Generate catalog entry
+        run: |
+          VERSION=$(python -c "import json; print(json.load(open('manifest.json'))['version'])")
+          URL="https://github.com/${{ github.repository }}/releases/download/${{ steps.tag.outputs.tag }}/gigachat-${VERSION}.zip"
+          python scripts/generate_catalog_entry.py \
+            --download-url "$URL" \
+            --brand-color "#000000" \
+            --icon gigachat
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: ${{ steps.tag.outputs.tag }}
+          draft: false
+          prerelease: ${{ contains(steps.tag.outputs.tag, '-') }}
+          generate_release_notes: true
+          files: |
+            dist/*.zip
+            dist/catalog-entry.json
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
